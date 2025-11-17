@@ -1,4 +1,4 @@
-from odoo import http
+from odoo import http, fields
 from odoo.http import request
 from datetime import datetime, time, timedelta
 import pytz
@@ -98,7 +98,15 @@ class AiAppointmentController(http.Controller):
     def _compute_free_slots(
         self, date_pref, duration_minutes, time_window, timezone_str, user_ids=None
     ):
-        """Same as your existing implementation"""
+        """
+        - Build working window in caller's timezone.
+        - Convert to UTC for DB queries.
+        - Fetch overlapping events from calendar.event, optionally filtered by user_ids.
+        - Merge busy intervals.
+        - Compute free intervals.
+        - Split into fixed-size slots.
+        - Return up to 10 slots (start/end in caller timezone).
+        """
         env = request.env
         CalendarEvent = env["calendar.event"].sudo()
 
@@ -181,7 +189,13 @@ class AiAppointmentController(http.Controller):
         return slots[:10]
 
     def _get_payload(self, params):
-        """Same as your existing implementation"""
+        """
+        Safely get JSON body regardless of how Odoo wraps it.
+        Priority:
+        - explicit params (kwargs)
+        - raw httprequest.data parsed as JSON
+        - if that JSON has "params", use that dict
+        """
         if params:
             return params
 
@@ -197,10 +211,35 @@ class AiAppointmentController(http.Controller):
             except Exception:
                 data = {}
 
+        # If JSON-RPC envelope: {"jsonrpc":"2.0","params":{...}}
         if isinstance(data, dict) and "params" in data and isinstance(data["params"], dict):
             data = data["params"]
 
         return data if isinstance(data, dict) else {}
+
+    def _convert_iso_to_odoo_format(self, iso_datetime_str):
+        """
+        Convert ISO datetime string with timezone to Odoo's datetime format.
+        
+        Args:
+            iso_datetime_str (str): ISO format datetime like "2025-11-17T13:00:00-05:00"
+            
+        Returns:
+            str: Odoo format datetime like "2025-11-17 18:00:00" (in UTC)
+        """
+        try:
+            # Parse ISO format with timezone
+            dt_with_tz = datetime.fromisoformat(iso_datetime_str)
+            
+            # Convert to UTC
+            dt_utc = dt_with_tz.astimezone(pytz.UTC)
+            
+            # Format for Odoo (naive datetime in UTC)
+            odoo_format = dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+            return odoo_format
+            
+        except Exception as e:
+            raise ValueError(f"Invalid datetime format '{iso_datetime_str}': {str(e)}")
 
     # ---------------------------------------------------------------------
     # POST /ai/appointments/check
@@ -368,12 +407,22 @@ class AiAppointmentController(http.Controller):
             if user:
                 user_id = user.id
 
+        # Convert ISO datetime strings to Odoo format
+        try:
+            start_odoo_format = self._convert_iso_to_odoo_format(start_iso)
+            end_odoo_format = self._convert_iso_to_odoo_format(end_iso)
+        except Exception as e:
+            return {
+                "status": "error", 
+                "message": str(e)
+            }
+
         # Create calendar event
         Event = env["calendar.event"].sudo()
         event_vals = {
             "name": f"{appointment_type} - {name}",
-            "start": start_iso,
-            "stop": end_iso,
+            "start": start_odoo_format,
+            "stop": end_odoo_format,
             "partner_ids": [(4, partner.id)],
             "description": notes,
         }
@@ -384,15 +433,22 @@ class AiAppointmentController(http.Controller):
         if "x_source" in Event._fields:
             event_vals["x_source"] = "ai_caller_agent"
 
-        event = Event.create(event_vals)
+        try:
+            event = Event.create(event_vals)
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to create appointment: {str(e)}"
+            }
 
-        # Localize response to partner timezone
+        # Localize response to partner timezone for confirmation
         partner_tz = partner.tz or "UTC"
         try:
             local_tz = pytz.timezone(partner_tz)
         except Exception:
             local_tz = pytz.UTC
 
+        # Convert back to local time for response
         start_local = event.start.astimezone(local_tz)
         end_local = event.stop.astimezone(local_tz)
 
@@ -402,4 +458,69 @@ class AiAppointmentController(http.Controller):
             "final_start": start_local.isoformat(),
             "final_end": end_local.isoformat(),
             "partner_id": partner.id,
+            "appointment_name": event.name,
         }
+
+    # ---------------------------------------------------------------------
+    # POST /ai/appointments/cancel
+    # ---------------------------------------------------------------------
+    @http.route(
+        "/ai/appointments/cancel",
+        type="json",
+        auth="public",
+        csrf=False,
+        methods=["POST"],
+    )
+    def cancel_appointment(self, **params):
+        """
+        Cancel an existing appointment.
+        
+        Body example:
+        {
+          "appointment_id": 123,
+          "reason": "Patient rescheduled"
+        }
+        """
+        params = self._get_payload(params)
+        
+        appointment_id = params.get("appointment_id")
+        reason = params.get("reason", "Cancelled via AI caller")
+        
+        if not appointment_id:
+            return {
+                "status": "error",
+                "message": "appointment_id is required.",
+            }
+        
+        env = request.env
+        Event = env["calendar.event"].sudo()
+        
+        try:
+            appointment_id = int(appointment_id)
+        except ValueError:
+            return {
+                "status": "error",
+                "message": "appointment_id must be a valid integer.",
+            }
+        
+        event = Event.browse(appointment_id)
+        if not event.exists():
+            return {
+                "status": "error",
+                "message": f"Appointment with ID {appointment_id} not found.",
+            }
+        
+        try:
+            event_name = event.name
+            event.unlink()
+            
+            return {
+                "status": "cancelled",
+                "message": f"Appointment '{event_name}' has been cancelled.",
+                "appointment_id": appointment_id,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to cancel appointment: {str(e)}",
+            }
