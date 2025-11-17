@@ -9,7 +9,7 @@
     "license": "LGPL-3",
     "depends": ["base", "calendar"],
     "data": [
-        "security/ir_model_access.csv",
+        "security/ir.model.access.csv",
     ],
     "installable": True,
     "application": False,
