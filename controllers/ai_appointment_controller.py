@@ -11,6 +11,7 @@ class AiAppointmentController(http.Controller):
 
     - POST /ai/appointments/check
     - POST /ai/appointments/book
+    - POST /ai/appointments/cancel
 
     Appointment scoping:
 
@@ -37,22 +38,14 @@ class AiAppointmentController(http.Controller):
         else:  # "any" or unknown
             return time(9, 0), time(17, 0)
 
-    def _resolve_user_from_appointment(self, appointment_type_id=None, appointment_type_name=None):
-        """
-        Use appointment.type to find which user calendar to use.
-
-        Priority:
-        1) appointment_type_id
-        2) appointment_type_name
-
-        Returns a res.users record or False.
-        """
+    def _get_appointment_type_obj(self, appointment_type_id=None, appointment_type_name=None):
+        """Get appointment type object for booking creation"""
         env = request.env
         
         # Try different possible model names for Odoo 18
         possible_models = [
-            "appointment.type",  # Most likely in Odoo 18
-            "calendar.appointment.type",
+            "appointment.type",
+            "calendar.appointment.type", 
             "appointment.appointment.type"
         ]
         
@@ -77,6 +70,23 @@ class AiAppointmentController(http.Controller):
 
         if not appt_type and appointment_type_name:
             appt_type = AppointmentType.search([("name", "=", appointment_type_name)], limit=1)
+
+        return appt_type
+
+    def _resolve_user_from_appointment(self, appointment_type_id=None, appointment_type_name=None):
+        """
+        Use appointment.type to find which user calendar to use.
+
+        Priority:
+        1) appointment_type_id
+        2) appointment_type_name
+
+        Returns a res.users record or False.
+        """
+        appt_type = self._get_appointment_type_obj(
+            appointment_type_id=appointment_type_id,
+            appointment_type_name=appointment_type_name
+        )
 
         if not appt_type:
             return False
@@ -241,6 +251,70 @@ class AiAppointmentController(http.Controller):
         except Exception as e:
             raise ValueError(f"Invalid datetime format '{iso_datetime_str}': {str(e)}")
 
+    def _create_appointment_booking(self, env, appointment_type_obj, partner, event, start_odoo_format, end_odoo_format, user_id=None):
+        """
+        Create appointment booking record in addition to calendar event.
+        """
+        try:
+            # Try different possible appointment booking models
+            booking_models = [
+                "appointment.booking",
+                "calendar.appointment.booking", 
+                "appointment.appointment.booking",
+                "appointment.invite"  # Alternative model
+            ]
+            
+            BookingModel = None
+            for model_name in booking_models:
+                if model_name in env:
+                    BookingModel = env[model_name].sudo()
+                    break
+            
+            if BookingModel and appointment_type_obj:
+                # Create appointment booking
+                booking_vals = {
+                    'name': f"{partner.name} - {appointment_type_obj.name}",
+                    'appointment_type_id': appointment_type_obj.id,
+                    'partner_id': partner.id,
+                    'start': start_odoo_format,
+                    'stop': end_odoo_format,
+                    'calendar_event_id': event.id,
+                }
+                
+                # Try to set booking state
+                if 'state' in BookingModel._fields:
+                    booking_vals['state'] = 'booked'
+                elif 'booking_status' in BookingModel._fields:
+                    booking_vals['booking_status'] = 'booked'
+                
+                # Try different field names for staff/user
+                staff_fields = ['staff_user_id', 'user_id', 'resource_id', 'appointment_resource_id']
+                staff_set = False
+                for field_name in staff_fields:
+                    if hasattr(BookingModel, field_name):
+                        # First try to get from appointment type
+                        if hasattr(appointment_type_obj, field_name):
+                            staff_user = getattr(appointment_type_obj, field_name)
+                            if staff_user:
+                                booking_vals[field_name] = staff_user.id
+                                staff_set = True
+                                break
+                        
+                        # If not found, use the user_id from parameters
+                        if not staff_set and user_id:
+                            booking_vals[field_name] = user_id
+                            staff_set = True
+                            break
+                
+                appointment_booking = BookingModel.create(booking_vals)
+                return appointment_booking
+                
+        except Exception as e:
+            # Log the error but don't fail the entire booking
+            print(f"Appointment booking creation failed: {str(e)}")
+        
+        return None
+
     # ---------------------------------------------------------------------
     # POST /ai/appointments/check
     # ---------------------------------------------------------------------
@@ -390,6 +464,7 @@ class AiAppointmentController(http.Controller):
 
         # Determine owner user_id (calendar owner)
         user_id = False
+        appointment_type_obj = False
 
         # 1) explicit email override
         if calendar_user_email:
@@ -406,6 +481,12 @@ class AiAppointmentController(http.Controller):
             )
             if user:
                 user_id = user.id
+            
+            # Get appointment type object for booking
+            appointment_type_obj = self._get_appointment_type_obj(
+                appointment_type_id=appointment_type_id,
+                appointment_type_name=appointment_type_name
+            )
 
         # Convert ISO datetime strings to Odoo format
         try:
@@ -438,8 +519,21 @@ class AiAppointmentController(http.Controller):
         except Exception as e:
             return {
                 "status": "error",
-                "message": f"Failed to create appointment: {str(e)}"
+                "message": f"Failed to create calendar event: {str(e)}"
             }
+
+        # Create appointment booking if possible
+        appointment_booking = None
+        if appointment_type_obj:
+            appointment_booking = self._create_appointment_booking(
+                env=env,
+                appointment_type_obj=appointment_type_obj,
+                partner=partner,
+                event=event,
+                start_odoo_format=start_odoo_format,
+                end_odoo_format=end_odoo_format,
+                user_id=user_id
+            )
 
         # Localize response to partner timezone for confirmation
         partner_tz = partner.tz or "UTC"
@@ -452,7 +546,7 @@ class AiAppointmentController(http.Controller):
         start_local = event.start.astimezone(local_tz)
         end_local = event.stop.astimezone(local_tz)
 
-        return {
+        response = {
             "status": "confirmed",
             "appointment_id": event.id,
             "final_start": start_local.isoformat(),
@@ -460,6 +554,14 @@ class AiAppointmentController(http.Controller):
             "partner_id": partner.id,
             "appointment_name": event.name,
         }
+        
+        if appointment_booking:
+            response["appointment_booking_id"] = appointment_booking.id
+            response["message"] = "Calendar event and appointment booking created successfully"
+        else:
+            response["message"] = "Calendar event created successfully (appointment booking may need manual creation)"
+
+        return response
 
     # ---------------------------------------------------------------------
     # POST /ai/appointments/cancel
@@ -512,6 +614,25 @@ class AiAppointmentController(http.Controller):
         
         try:
             event_name = event.name
+            
+            # Also try to cancel appointment booking if exists
+            booking_models = [
+                "appointment.booking",
+                "calendar.appointment.booking", 
+                "appointment.appointment.booking"
+            ]
+            
+            for model_name in booking_models:
+                if model_name in env:
+                    BookingModel = env[model_name].sudo()
+                    booking = BookingModel.search([('calendar_event_id', '=', appointment_id)], limit=1)
+                    if booking:
+                        if hasattr(booking, 'state'):
+                            booking.state = 'canceled'
+                        elif hasattr(booking, 'booking_status'):
+                            booking.booking_status = 'canceled'
+                        break
+            
             event.unlink()
             
             return {
