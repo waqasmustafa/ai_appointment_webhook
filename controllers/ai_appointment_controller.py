@@ -1,4 +1,5 @@
-from odoo import http, fields
+# -*- coding: utf-8 -*-
+from odoo import http
 from odoo.http import request
 from datetime import datetime, time, timedelta
 import pytz
@@ -6,682 +7,283 @@ import json
 
 
 class AiAppointmentController(http.Controller):
-    """
-    JSON webhooks for AI caller:
 
-    - POST /ai/appointments/check
-    - POST /ai/appointments/book
-    - POST /ai/appointments/cancel
-
-    Appointment scoping:
-
-    You can target a specific Odoo Appointment by sending either:
-
-      "appointment_type_id": 11
-         OR
-      "appointment_type_name": "Dr Drizzle"
-
-    The controller will use that appointment type's staff members.
-    """
-
-    # ---------------------------------------------------------------------
-    # Helpers
-    # ---------------------------------------------------------------------
-    def _get_window_hours(self, time_window):
-        """Map time_window keyword to a working-hour interval."""
-        if time_window == "morning":
-            return time(9, 0), time(12, 0)
-        elif time_window == "afternoon":
-            return time(13, 0), time(17, 0)
-        elif time_window == "evening":
-            return time(17, 0), time(20, 0)
-        else:  # "any" or unknown
-            return time(9, 0), time(17, 0)
-
-    def _get_appointment_type_obj(self, appointment_type_id=None, appointment_type_name=None):
-        """Get appointment type object for booking creation"""
-        env = request.env
-
-        # Try different possible model names for Odoo 18
-        possible_models = [
-            "appointment.type",
-            "calendar.appointment.type",
-            "appointment.appointment.type",
-        ]
-
-        AppointmentType = None
-        for model_name in possible_models:
-            if model_name in env:
-                AppointmentType = env[model_name].sudo()
-                break
-
-        if not AppointmentType:
-            return False
-
-        appt_type = False
-
-        if appointment_type_id:
-            try:
-                appt_type = AppointmentType.browse(int(appointment_type_id))
-            except Exception:
-                appt_type = False
-            if appt_type and not appt_type.exists():
-                appt_type = False
-
-        if not appt_type and appointment_type_name:
-            appt_type = AppointmentType.search([("name", "=", appointment_type_name)], limit=1)
-
-        return appt_type
-
-    def _resolve_user_from_appointment(self, appointment_type_id=None, appointment_type_name=None):
-        """
-        Use appointment.type to find which user calendar to use.
-
-        Priority:
-        1) appointment_type_id
-        2) appointment_type_name
-
-        Returns a res.users record or False.
-        """
-        appt_type = self._get_appointment_type_obj(
-            appointment_type_id=appointment_type_id,
-            appointment_type_name=appointment_type_name,
-        )
-
-        if not appt_type:
-            return False
-
-        # Get staff members from appointment type
-        # Try different possible field names
-        user_field_names = ["staff_user_ids", "user_ids", "resource_ids"]
-        users = False
-
-        for field_name in user_field_names:
-            if hasattr(appt_type, field_name):
-                users = getattr(appt_type, field_name)
-                if users:
-                    break
-
-        user = users[:1] if users else False
-        return user
-
-    def _compute_free_slots(
-        self, date_pref, duration_minutes, time_window, timezone_str, user_ids=None
-    ):
-        """
-        - Build working window in caller's timezone.
-        - Convert to UTC for DB queries.
-        - Fetch overlapping events from calendar.event, optionally filtered by user_ids.
-        - Merge busy intervals.
-        - Compute free intervals.
-        - Split into fixed-size slots.
-        - Return up to 10 slots (start/end in caller timezone).
-        """
-        env = request.env
-        CalendarEvent = env["calendar.event"].sudo()
-
-        # Parse date
-        try:
-            year, month, day = map(int, date_pref.split("-"))
-        except Exception:
-            raise ValueError("Invalid date_preference format. Expected YYYY-MM-DD.")
-
-        # Resolve timezone
-        try:
-            tz = pytz.timezone(timezone_str or "UTC")
-        except Exception:
-            tz = pytz.UTC
-
-        # Working window in local time
-        start_hour, end_hour = self._get_window_hours(time_window)
-        day_start_local = tz.localize(
-            datetime(year, month, day, start_hour.hour, start_hour.minute)
-        )
-        day_end_local = tz.localize(
-            datetime(year, month, day, end_hour.hour, end_hour.minute)
-        )
-
-        # Convert to UTC for DB search
-        day_start_utc = day_start_local.astimezone(pytz.UTC)
-        day_end_utc = day_end_local.astimezone(pytz.UTC)
-
-        # Build search domain
-        domain = [
-            ("start", "<", day_end_utc),
-            ("stop", ">", day_start_utc),
-        ]
-        if user_ids:
-            domain.append(("user_id", "in", user_ids))
-
-        busy_events = CalendarEvent.search(domain)
-
-        # Collect busy intervals
-        busy_intervals = [(ev.start, ev.stop) for ev in busy_events]
-        busy_intervals.sort(key=lambda x: x[0])
-
-        # Merge overlapping intervals
-        merged = []
-        for interval in busy_intervals:
-            if not merged:
-                merged.append([interval[0], interval[1]])
-            else:
-                last = merged[-1]
-                if interval[0] <= last[1]:
-                    last[1] = max(last[1], interval[1])
-                else:
-                    merged.append([interval[0], interval[1]])
-
-        # Compute free intervals
-        free_intervals = []
-        current_start = day_start_utc
-        for b_start, b_end in merged:
-            if b_start > current_start:
-                free_intervals.append((current_start, b_start))
-            current_start = max(current_start, b_end)
-        if current_start < day_end_utc:
-            free_intervals.append((current_start, day_end_utc))
-
-        # Split free intervals into slots
-        delta = timedelta(minutes=duration_minutes)
-        slots = []
-        for f_start, f_end in free_intervals:
-            slot_start = f_start
-            while slot_start + delta <= f_end:
-                slot_end = slot_start + delta
-                local_start = slot_start.astimezone(tz)
-                local_end = slot_end.astimezone(tz)
-                slots.append(
-                    {
-                        "start": local_start.isoformat(),
-                        "end": local_end.isoformat(),
-                    }
-                )
-                slot_start += delta
-
-        return slots[:10]
-
+    # ==========================================================================
+    # SAFE PAYLOAD PARSER  (Handles JSON, JSON-RPC, Postman etc)
+    # ==========================================================================
     def _get_payload(self, params):
-        """
-        Safely get JSON body regardless of how Odoo wraps it.
-        Priority:
-        - explicit params (kwargs)
-        - raw httprequest.data parsed as JSON
-        - if that JSON has "params", use that dict
-        """
         if params:
             return params
 
         data = {}
         try:
             raw = request.httprequest.data
-        except Exception:
-            raw = b""
-
-        if raw:
-            try:
+            if raw:
                 data = json.loads(raw.decode("utf-8"))
-            except Exception:
-                data = {}
+        except Exception:
+            data = {}
 
-        # If JSON-RPC envelope: {"jsonrpc":"2.0","params":{...}}
+        # JSON-RPC envelope?
         if isinstance(data, dict) and "params" in data and isinstance(data["params"], dict):
             data = data["params"]
 
-        return data if isinstance(data, dict) else {}
+        return data
 
-    def _convert_iso_to_odoo_format(self, iso_datetime_str):
-        """
-        Convert ISO datetime string with timezone to Odoo's datetime format.
+    # ==========================================================================
+    # GET APPOINTMENT TYPE (Model: appointment.type)
+    # ==========================================================================
+    def _get_appt_type(self, appt_id=None, appt_name=None):
+        AppointmentType = request.env["appointment.type"].sudo()
 
-        Args:
-            iso_datetime_str (str): ISO format datetime like "2025-11-17T13:00:00-05:00"
+        rec = False
 
-        Returns:
-            str: Odoo format datetime like "2025-11-17 18:00:00" (in UTC)
-        """
+        if appt_id:
+            try:
+                rec = AppointmentType.browse(int(appt_id))
+                if not rec.exists():
+                    rec = False
+            except:
+                rec = False
+
+        if not rec and appt_name:
+            rec = AppointmentType.search([("name", "=", appt_name)], limit=1)
+
+        return rec
+
+    # ==========================================================================
+    # DETERMINE STAFF USER (appointment.type.staff_user_ids)
+    # ==========================================================================
+    def _resolve_staff_user(self, appt_type):
+        if not appt_type:
+            return False
+
+        if hasattr(appt_type, "staff_user_ids") and appt_type.staff_user_ids:
+            return appt_type.staff_user_ids[:1]
+
+        return False
+
+    # ==========================================================================
+    # CONVERT WORK WINDOW BASED ON TIME WINDOW
+    # ==========================================================================
+    def _get_window_hours(self, window):
+        if window == "morning":
+            return (time(9, 0), time(12, 0))
+        elif window == "afternoon":
+            return (time(13, 0), time(17, 0))
+        return (time(9, 0), time(17, 0))  # default
+
+    # ==========================================================================
+    # COMPUTE FREE SLOTS
+    # ==========================================================================
+    def _compute_free_slots(self, date_pref, duration, time_window, tz, user_id):
+
+        CalendarEvent = request.env["calendar.event"].sudo()
+
+        year, month, day = map(int, date_pref.split("-"))
         try:
-            # Parse ISO format with timezone
-            dt_with_tz = datetime.fromisoformat(iso_datetime_str)
+            tz_local = pytz.timezone(tz)
+        except:
+            tz_local = pytz.UTC
 
-            # Convert to UTC
-            dt_utc = dt_with_tz.astimezone(pytz.UTC)
+        wh_start, wh_end = self._get_window_hours(time_window)
 
-            # Format for Odoo (naive datetime in UTC)
-            odoo_format = dt_utc.strftime("%Y-%m-%d %H:%M:%S")
-            return odoo_format
+        day_start_local = tz_local.localize(datetime(year, month, day, wh_start.hour, wh_start.minute))
+        day_end_local = tz_local.localize(datetime(year, month, day, wh_end.hour, wh_end.minute))
 
-        except Exception as e:
-            raise ValueError(f"Invalid datetime format '{iso_datetime_str}': {str(e)}")
+        day_start_utc = day_start_local.astimezone(pytz.UTC)
+        day_end_utc = day_end_local.astimezone(pytz.UTC)
 
-    def _create_appointment_booking(
-        self,
-        env,
-        appointment_type_obj,
-        partner,
-        event,
-        start_odoo_format,
-        end_odoo_format,
-        user_id=None,
-    ):
-        """
-        Create appointment booking record in addition to calendar event.
-        """
-        try:
-            # Try different possible appointment booking models
-            booking_models = [
-                "appointment.booking",
-                "calendar.appointment.booking",
-                "appointment.appointment.booking",
-                "appointment.invite",  # Alternative model
-            ]
+        domain = [
+            ("start", "<", day_end_utc),
+            ("stop", ">", day_start_utc),
+        ]
+        if user_id:
+            domain.append(("user_id", "=", user_id))
 
-            BookingModel = None
-            for model_name in booking_models:
-                if model_name in env:
-                    BookingModel = env[model_name].sudo()
-                    break
+        busy = CalendarEvent.search(domain)
 
-            if BookingModel and appointment_type_obj:
-                # Create appointment booking
-                booking_vals = {
-                    "name": f"{partner.name} - {appointment_type_obj.name}",
-                    "appointment_type_id": appointment_type_obj.id,
-                    "partner_id": partner.id,
-                    "start": start_odoo_format,
-                    "stop": end_odoo_format,
-                    "calendar_event_id": event.id,
-                }
+        # Merge intervals
+        busy_intervals = sorted([(ev.start, ev.stop) for ev in busy], key=lambda x: x[0])
 
-                # Try to set booking state
-                if "state" in BookingModel._fields:
-                    booking_vals["state"] = "booked"
-                elif "booking_status" in BookingModel._fields:
-                    booking_vals["booking_status"] = "booked"
+        merged = []
+        for rng in busy_intervals:
+            if not merged:
+                merged.append([rng[0], rng[1]])
+            else:
+                last = merged[-1]
+                if rng[0] <= last[1]:
+                    last[1] = max(last[1], rng[1])
+                else:
+                    merged.append([rng[0], rng[1]])
 
-                # Try different field names for staff/user
-                staff_fields = [
-                    "staff_user_id",
-                    "user_id",
-                    "resource_id",
-                    "appointment_resource_id",
-                ]
-                staff_set = False
-                for field_name in staff_fields:
-                    if field_name in BookingModel._fields:
-                        # First try to get from appointment type
-                        if hasattr(appointment_type_obj, field_name):
-                            staff_user = getattr(appointment_type_obj, field_name)
-                            if staff_user:
-                                booking_vals[field_name] = staff_user.id
-                                staff_set = True
-                                break
+        # Find free blocks
+        free = []
+        current = day_start_utc
+        for b in merged:
+            if b[0] > current:
+                free.append((current, b[0]))
+            current = max(current, b[1])
+        if current < day_end_utc:
+            free.append((current, day_end_utc))
 
-                        # If not found, use the user_id from parameters
-                        if not staff_set and user_id:
-                            booking_vals[field_name] = user_id
-                            staff_set = True
-                            break
+        # Split into slots
+        delta = timedelta(minutes=duration)
+        slots = []
+        for f in free:
+            start = f[0]
+            while start + delta <= f[1]:
+                end = start + delta
+                slots.append({
+                    "start": start.astimezone(tz_local).isoformat(),
+                    "end": end.astimezone(tz_local).isoformat(),
+                })
+                start += delta
 
-                appointment_booking = BookingModel.create(booking_vals)
-                return appointment_booking
+        return slots[:10]
 
-        except Exception as e:
-            # Log the error but don't fail the entire booking
-            print(f"Appointment booking creation failed: {str(e)}")
-
-        return None
-
-    # ---------------------------------------------------------------------
-    # POST /ai/appointments/check
-    # ---------------------------------------------------------------------
-    @http.route(
-        "/ai/appointments/check",
-        type="json",
-        auth="public",
-        csrf=False,
-        methods=["POST"],
-    )
+    # ==========================================================================
+    # CHECK AVAILABILITY
+    # ==========================================================================
+    @http.route("/ai/appointments/check", type="json", auth="public", csrf=False, methods=["POST"])
     def check_availability(self, **params):
-        """
-        Body example:
 
-        {
-          "appointment_type_id": 11,
-          "appointment_type_name": "Dr Drizzle",
-          "date_preference": "2025-11-17",
-          "time_window": "afternoon",
-          "timezone": "America/New_York",
-          "duration_minutes": 60
-        }
-        """
         params = self._get_payload(params)
 
         date_pref = params.get("date_preference")
         if not date_pref:
-            return {
-                "status": "error",
-                "message": "date_preference is required (YYYY-MM-DD).",
-            }
+            return {"status": "error", "message": "date_preference is required"}
 
-        appointment_type_id = params.get("appointment_type_id") or params.get(
-            "appointment_id"
-        )
-        appointment_type_name = params.get("appointment_type_name") or params.get(
-            "appointment_title"
-        )
+        appt_id = params.get("appointment_type_id")
+        appt_name = params.get("appointment_type_name")
         time_window = params.get("time_window", "any")
-        timezone_str = params.get("timezone", "UTC")
-        duration = params.get("duration_minutes", 30)
-        calendar_user_email = params.get("calendar_user_email")
+        tz = params.get("timezone", "UTC")
+        duration = int(params.get("duration_minutes", 30))
 
-        try:
-            duration = int(duration)
-        except Exception:
-            return {
-                "status": "error",
-                "message": "duration_minutes must be an integer.",
-            }
+        appt_type = self._get_appt_type(appt_id, appt_name)
+        if not appt_type:
+            return {"status": "error", "message": "Appointment type not found"}
 
-        # Figure out which user calendar to use
-        user_ids = []
-        env = request.env
+        staff = self._resolve_staff_user(appt_type)
+        if not staff:
+            return {"status": "error", "message": "No staff assigned to this appointment type"}
 
-        # 1) explicit email override
-        if calendar_user_email:
-            User = env["res.users"].sudo()
-            user = User.search([("email", "=", calendar_user_email)], limit=1)
-            if user:
-                user_ids = [user.id]
+        slots = self._compute_free_slots(date_pref, duration, time_window, tz, staff.id)
 
-        # 2) else derive from appointment type
-        if not user_ids and (appointment_type_id or appointment_type_name):
-            user = self._resolve_user_from_appointment(
-                appointment_type_id=appointment_type_id,
-                appointment_type_name=appointment_type_name,
-            )
-            if user:
-                user_ids = [user.id]
+        return {"status": "ok", "slots": slots}
 
-        try:
-            slots = self._compute_free_slots(
-                date_pref=date_pref,
-                duration_minutes=duration,
-                time_window=time_window,
-                timezone_str=timezone_str,
-                user_ids=user_ids or None,
-            )
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-        return {
-            "status": "ok",
-            "slots": slots,
-        }
-
-    # ---------------------------------------------------------------------
-    # POST /ai/appointments/book
-    # ---------------------------------------------------------------------
-    @http.route(
-        "/ai/appointments/book",
-        type="json",
-        auth="public",
-        csrf=False,
-        methods=["POST"],
-    )
+    # ==========================================================================
+    # BOOK APPOINTMENT
+    # ==========================================================================
+    @http.route("/ai/appointments/book", type="json", auth="public", csrf=False, methods=["POST"])
     def book_appointment(self, **params):
-        """
-        Body example:
 
-        {
-          "appointment_type_id": 11,
-          "appointment_type_name": "Dr Drizzle",
-          "appointment_type": "Dr Drizzle - Online",
-          "slot_start": "2025-11-17T13:00:00-05:00",
-          "slot_end": "2025-11-17T14:00:00-05:00",
-          "caller_name": "John Smith",
-          "caller_phone": "+15551234567",
-          "caller_email": "john@example.com",
-          "notes": "Booked via AI caller."
-        }
-        """
         params = self._get_payload(params)
 
-        name = params.get("caller_name") or "Unknown"
-        phone = params.get("caller_phone")
+        name = params.get("caller_name", "Unknown")
         email = params.get("caller_email")
-        start_iso = params.get("slot_start")
-        end_iso = params.get("slot_end")
-        appointment_type = params.get("appointment_type", "Consultation")
+        phone = params.get("caller_phone")
         notes = params.get("notes", "")
 
-        appointment_type_id = params.get("appointment_type_id") or params.get(
-            "appointment_id"
-        )
-        appointment_type_name = params.get("appointment_type_name") or params.get(
-            "appointment_title"
-        )
-        calendar_user_email = params.get("calendar_user_email")
+        start_iso = params.get("slot_start")
+        end_iso = params.get("slot_end")
+        if not start_iso or not end_iso:
+            return {"status": "error", "message": "slot_start and slot_end required"}
 
-        if not (start_iso and end_iso):
-            return {
-                "status": "error",
-                "message": "slot_start and slot_end are required.",
-            }
+        appt_id = params.get("appointment_type_id")
+        appt_name = params.get("appointment_type_name")
 
-        env = request.env
+        appt_type = self._get_appt_type(appt_id, appt_name)
+        if not appt_type:
+            return {"status": "error", "message": "Appointment type not found"}
 
-        # Partner (caller)
-        Partner = env["res.partner"].sudo()
-        partner = None
+        staff = self._resolve_staff_user(appt_type)
+
+        # Convert slot ISO → UTC → Odoo datetime
+        start_dt = datetime.fromisoformat(start_iso).astimezone(pytz.UTC)
+        end_dt = datetime.fromisoformat(end_iso).astimezone(pytz.UTC)
+
+        start_odoo = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_odoo = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Create or find partner
+        Partner = request.env["res.partner"].sudo()
+        partner = False
         if email:
             partner = Partner.search([("email", "=", email)], limit=1)
         if not partner and phone:
             partner = Partner.search([("phone", "=", phone)], limit=1)
 
         if not partner:
-            vals = {"name": name}
-            if phone:
-                vals["phone"] = phone
-            if email:
-                vals["email"] = email
-            partner = Partner.create(vals)
+            partner = Partner.create({
+                "name": name,
+                "email": email,
+                "phone": phone,
+            })
 
-        # Determine owner user_id (calendar owner)
-        user_id = False
-        appointment_type_obj = None
-
-        # 1) explicit email override
-        if calendar_user_email:
-            User = env["res.users"].sudo()
-            user = User.search([("email", "=", calendar_user_email)], limit=1)
-            if user:
-                user_id = user.id
-
-        # 2) derive from appointment type (for user + type object)
-        if appointment_type_id or appointment_type_name:
-            # always try to get the type record
-            appointment_type_obj = self._get_appointment_type_obj(
-                appointment_type_id=appointment_type_id,
-                appointment_type_name=appointment_type_name,
-            )
-
-            # if user still not set, pick from that type
-            if not user_id:
-                user = self._resolve_user_from_appointment(
-                    appointment_type_id=appointment_type_id,
-                    appointment_type_name=appointment_type_name,
-                )
-                if user:
-                    user_id = user.id
-
-        # Convert ISO datetime strings to Odoo format
-        try:
-            start_odoo_format = self._convert_iso_to_odoo_format(start_iso)
-            end_odoo_format = self._convert_iso_to_odoo_format(end_iso)
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-        # Create calendar event
-        Event = env["calendar.event"].sudo()
-        event_vals = {
-            "name": f"{appointment_type} - {name}",
-            "start": start_odoo_format,
-            "stop": end_odoo_format,
+        # Create Calendar Event
+        Event = request.env["calendar.event"].sudo()
+        event = Event.create({
+            "name": f"{appt_type.name} - {name}",
+            "start": start_odoo,
+            "stop": end_odoo,
+            "user_id": staff.id,
             "partner_ids": [(4, partner.id)],
+            "appointment_type_id": appt_type.id,
             "description": notes,
-        }
-        if user_id:
-            event_vals["user_id"] = user_id
+        })
 
-        # Optional custom field
-        if "x_source" in Event._fields:
-            event_vals["x_source"] = "ai_caller_agent"
+        # Create Appointment Booking
+        Booking = request.env["appointment.booking"].sudo()
+        booking = Booking.create({
+            "appointment_type_id": appt_type.id,
+            "calendar_event_id": event.id,
+            "partner_id": partner.id,
+            "start": start_odoo,
+            "stop": end_odoo,
+            "state": "booked",
+        })
 
-        # 🔗 Link event to the Appointment Type so it appears under Dr Drizzle
-        if appointment_type_obj:
-            if "appointment_type_id" in Event._fields:
-                event_vals["appointment_type_id"] = appointment_type_obj.id
-            else:
-                # Fallback: try a few possible field names on calendar.event
-                for field_name in ["appointment_type", "appointment_id"]:
-                    if field_name in Event._fields:
-                        event_vals[field_name] = appointment_type_obj.id
-                        break
-
+        # Trigger Odoo confirmation email
         try:
-            event = Event.create(event_vals)
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to create calendar event: {str(e)}",
-            }
+            template = request.env.ref("appointment.mail_template_data_app_appointment")
+            template.sudo().send_mail(booking.id, force_send=True)
+        except:
+            pass  # email is optional
 
-        # Create appointment booking if possible
-        appointment_booking = None
-        if appointment_type_obj:
-            appointment_booking = self._create_appointment_booking(
-                env=env,
-                appointment_type_obj=appointment_type_obj,
-                partner=partner,
-                event=event,
-                start_odoo_format=start_odoo_format,
-                end_odoo_format=end_odoo_format,
-                user_id=user_id,
-            )
-
-        # Localize response to partner timezone for confirmation
-        partner_tz = partner.tz or "UTC"
-        try:
-            local_tz = pytz.timezone(partner_tz)
-        except Exception:
-            local_tz = pytz.UTC
-
-        # Convert back to local time for response
-        start_local = event.start.astimezone(local_tz)
-        end_local = event.stop.astimezone(local_tz)
-
-        response = {
+        return {
             "status": "confirmed",
             "appointment_id": event.id,
-            "final_start": start_local.isoformat(),
-            "final_end": end_local.isoformat(),
+            "booking_id": booking.id,
+            "final_start": start_dt.isoformat(),
+            "final_end": end_dt.isoformat(),
             "partner_id": partner.id,
             "appointment_name": event.name,
+            "message": "Appointment successfully booked",
         }
 
-        if appointment_booking:
-            response["appointment_booking_id"] = appointment_booking.id
-            response["message"] = (
-                "Calendar event and appointment booking created successfully"
-            )
-        else:
-            response["message"] = (
-                "Calendar event created successfully (appointment booking may need manual creation)"
-            )
-
-        return response
-
-    # ---------------------------------------------------------------------
-    # POST /ai/appointments/cancel
-    # ---------------------------------------------------------------------
-    @http.route(
-        "/ai/appointments/cancel",
-        type="json",
-        auth="public",
-        csrf=False,
-        methods=["POST"],
-    )
+    # ==========================================================================
+    # CANCEL APPOINTMENT
+    # ==========================================================================
+    @http.route("/ai/appointments/cancel", type="json", auth="public", csrf=False, methods=["POST"])
     def cancel_appointment(self, **params):
-        """
-        Cancel an existing appointment.
 
-        Body example:
-        {
-          "appointment_id": 123,
-          "reason": "Patient rescheduled"
-        }
-        """
         params = self._get_payload(params)
 
-        appointment_id = params.get("appointment_id")
-        reason = params.get("reason", "Cancelled via AI caller")
+        appt_id = params.get("appointment_id")
+        if not appt_id:
+            return {"status": "error", "message": "appointment_id required"}
 
-        if not appointment_id:
-            return {
-                "status": "error",
-                "message": "appointment_id is required.",
-            }
-
-        env = request.env
-        Event = env["calendar.event"].sudo()
-
-        try:
-            appointment_id = int(appointment_id)
-        except ValueError:
-            return {
-                "status": "error",
-                "message": "appointment_id must be a valid integer.",
-            }
-
-        event = Event.browse(appointment_id)
+        Event = request.env["calendar.event"].sudo()
+        event = Event.browse(int(appt_id))
         if not event.exists():
-            return {
-                "status": "error",
-                "message": f"Appointment with ID {appointment_id} not found.",
-            }
+            return {"status": "error", "message": "Appointment not found"}
 
-        try:
-            event_name = event.name
+        # Cancel booking
+        Booking = request.env["appointment.booking"].sudo()
+        booking = Booking.search([("calendar_event_id", "=", event.id)], limit=1)
+        if booking:
+            booking.state = "cancelled"
 
-            # Also try to cancel appointment booking if exists
-            booking_models = [
-                "appointment.booking",
-                "calendar.appointment.booking",
-                "appointment.appointment.booking",
-            ]
+        event.unlink()
 
-            for model_name in booking_models:
-                if model_name in env:
-                    BookingModel = env[model_name].sudo()
-                    booking = BookingModel.search(
-                        [("calendar_event_id", "=", appointment_id)], limit=1
-                    )
-                    if booking:
-                        if "state" in booking._fields:
-                            booking.state = "canceled"
-                        elif "booking_status" in booking._fields:
-                            booking.booking_status = "canceled"
-                        break
-
-            event.unlink()
-
-            return {
-                "status": "cancelled",
-                "message": f"Appointment '{event_name}' has been cancelled.",
-                "appointment_id": appointment_id,
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to cancel appointment: {str(e)}",
-            }
+        return {"status": "cancelled", "appointment_id": appt_id}
