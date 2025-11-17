@@ -2,6 +2,7 @@ from odoo import http
 from odoo.http import request
 from datetime import datetime, time, timedelta
 import pytz
+import json
 
 
 class AiAppointmentController(http.Controller):
@@ -168,6 +169,35 @@ class AiAppointmentController(http.Controller):
 
         return slots[:10]
 
+    def _get_payload(self, params):
+        """
+        Safely get JSON body regardless of how Odoo wraps it.
+        Priority:
+        - explicit params (kwargs)
+        - raw httprequest.data parsed as JSON
+        - if that JSON has "params", use that dict
+        """
+        if params:
+            return params
+
+        data = {}
+        try:
+            raw = request.httprequest.data
+        except Exception:
+            raw = b""
+
+        if raw:
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                data = {}
+
+        # If JSON-RPC envelope: {"jsonrpc":"2.0","params":{...}}
+        if isinstance(data, dict) and "params" in data and isinstance(data["params"], dict):
+            data = data["params"]
+
+        return data if isinstance(data, dict) else {}
+
     # ---------------------------------------------------------------------
     # POST /ai/appointments/check
     # ---------------------------------------------------------------------
@@ -180,30 +210,19 @@ class AiAppointmentController(http.Controller):
     )
     def check_availability(self, **params):
         """
-        Example body for Dr Drizzle (URL /appointment/11):
+        Body example:
 
         {
           "appointment_id": 11,
-          "date_preference": "2025-11-17",
-          "time_window": "afternoon",
-          "timezone": "America/New_York",
-          "duration_minutes": 60
-        }
-
-        OR using title:
-
-        {
           "appointment_title": "Dr Drizzle",
           "date_preference": "2025-11-17",
           "time_window": "afternoon",
           "timezone": "America/New_York",
           "duration_minutes": 60
         }
-
-        Optional override:
-          "calendar_user_email": "hammad@workforcesync.io"
         """
-        # params already contains JSON body because type="json"
+        params = self._get_payload(params)
+
         date_pref = params.get("date_preference")
         if not date_pref:
             return {
@@ -274,10 +293,11 @@ class AiAppointmentController(http.Controller):
     )
     def book_appointment(self, **params):
         """
-        Example body for booking a Dr Drizzle slot:
+        Body example:
 
         {
           "appointment_id": 11,
+          "appointment_title": "Dr Drizzle",
           "appointment_type": "Dr Drizzle - Online",
           "slot_start": "2025-11-17T13:00:00-05:00",
           "slot_end": "2025-11-17T14:00:00-05:00",
@@ -286,10 +306,9 @@ class AiAppointmentController(http.Controller):
           "caller_email": "john@example.com",
           "notes": "Booked via AI caller."
         }
-
-        You can also send "appointment_title": "Dr Drizzle"
-        and/or "calendar_user_email" to override.
         """
+        params = self._get_payload(params)
+
         name = params.get("caller_name") or "Unknown"
         phone = params.get("caller_phone")
         email = params.get("caller_email")
