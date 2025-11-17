@@ -178,7 +178,7 @@ class AiAppointmentController(http.Controller):
         csrf=False,
         methods=["POST"],
     )
-    def check_availability(self, **kwargs):
+    def check_availability(self, **params):
         """
         Example body for Dr Drizzle (URL /appointment/11):
 
@@ -203,8 +203,7 @@ class AiAppointmentController(http.Controller):
         Optional override:
           "calendar_user_email": "hammad@workforcesync.io"
         """
-        params = request.jsonrequest or {}
-
+        # params already contains JSON body because type="json"
         date_pref = params.get("date_preference")
         if not date_pref:
             return {
@@ -273,7 +272,7 @@ class AiAppointmentController(http.Controller):
         csrf=False,
         methods=["POST"],
     )
-    def book_appointment(self, **kwargs):
+    def book_appointment(self, **params):
         """
         Example body for booking a Dr Drizzle slot:
 
@@ -291,8 +290,6 @@ class AiAppointmentController(http.Controller):
         You can also send "appointment_title": "Dr Drizzle"
         and/or "calendar_user_email" to override.
         """
-        params = request.jsonrequest or {}
-
         name = params.get("caller_name") or "Unknown"
         phone = params.get("caller_phone")
         email = params.get("caller_email")
