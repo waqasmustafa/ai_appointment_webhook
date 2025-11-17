@@ -14,20 +14,13 @@ class AiAppointmentController(http.Controller):
 
     Appointment scoping:
 
-    You can target a specific Odoo Appointment (like /appointment/11 - "Dr Drizzle")
-    by sending either:
+    You can target a specific Odoo Appointment by sending either:
 
-      "appointment_id": 11
+      "appointment_type_id": 11
          OR
-      "appointment_title": "Dr Drizzle"
+      "appointment_type_name": "Dr Drizzle"
 
-    The controller will:
-    - read appointment.appointment (Odoo's Appointment app)
-    - take the first user in appointment.user_ids (Users field)
-    - use that user's calendar (calendar.event.user_id) for availability & booking.
-
-    Optional:
-      "calendar_user_email" overrides the user coming from the appointment.
+    The controller will use that appointment type's staff members.
     """
 
     # ---------------------------------------------------------------------
@@ -44,50 +37,68 @@ class AiAppointmentController(http.Controller):
         else:  # "any" or unknown
             return time(9, 0), time(17, 0)
 
-    def _resolve_user_from_appointment(self, appointment_id=None, appointment_title=None):
+    def _resolve_user_from_appointment(self, appointment_type_id=None, appointment_type_name=None):
         """
-        Use appointment.appointment to find which user calendar to use.
+        Use appointment.type to find which user calendar to use.
 
         Priority:
-        1) appointment_id (e.g. 11 from /appointment/11)
-        2) appointment_title (e.g. "Dr Drizzle")
+        1) appointment_type_id
+        2) appointment_type_name
 
         Returns a res.users record or False.
         """
-        Appointment = request.env["appointment.appointment"].sudo()
-        appt = False
-
-        if appointment_id:
-            # ID from /appointment/11
-            try:
-                appt = Appointment.browse(int(appointment_id))
-            except Exception:
-                appt = False
-            if appt and not appt.exists():
-                appt = False
-
-        if not appt and appointment_title:
-            appt = Appointment.search([("name", "=", appointment_title)], limit=1)
-
-        if not appt:
+        env = request.env
+        
+        # Try different possible model names for Odoo 18
+        possible_models = [
+            "appointment.type",  # Most likely in Odoo 18
+            "calendar.appointment.type",
+            "appointment.appointment.type"
+        ]
+        
+        AppointmentType = None
+        for model_name in possible_models:
+            if model_name in env:
+                AppointmentType = env[model_name].sudo()
+                break
+        
+        if not AppointmentType:
             return False
 
-        # Appointment "Users" m2m (typically field user_ids)
-        user = appt.user_ids[:1]
-        return user or False
+        appt_type = False
+
+        if appointment_type_id:
+            try:
+                appt_type = AppointmentType.browse(int(appointment_type_id))
+            except Exception:
+                appt_type = False
+            if appt_type and not appt_type.exists():
+                appt_type = False
+
+        if not appt_type and appointment_type_name:
+            appt_type = AppointmentType.search([("name", "=", appointment_type_name)], limit=1)
+
+        if not appt_type:
+            return False
+
+        # Get staff members from appointment type
+        # Try different possible field names
+        user_field_names = ["staff_user_ids", "user_ids", "resource_ids"]
+        users = False
+        
+        for field_name in user_field_names:
+            if hasattr(appt_type, field_name):
+                users = getattr(appt_type, field_name)
+                if users:
+                    break
+
+        user = users[:1] if users else False
+        return user
 
     def _compute_free_slots(
         self, date_pref, duration_minutes, time_window, timezone_str, user_ids=None
     ):
-        """
-        - Build working window in caller's timezone.
-        - Convert to UTC for DB queries.
-        - Fetch overlapping events from calendar.event, optionally filtered by user_ids.
-        - Merge busy intervals.
-        - Compute free intervals.
-        - Split into fixed-size slots.
-        - Return up to 10 slots (start/end in caller timezone).
-        """
+        """Same as your existing implementation"""
         env = request.env
         CalendarEvent = env["calendar.event"].sudo()
 
@@ -170,13 +181,7 @@ class AiAppointmentController(http.Controller):
         return slots[:10]
 
     def _get_payload(self, params):
-        """
-        Safely get JSON body regardless of how Odoo wraps it.
-        Priority:
-        - explicit params (kwargs)
-        - raw httprequest.data parsed as JSON
-        - if that JSON has "params", use that dict
-        """
+        """Same as your existing implementation"""
         if params:
             return params
 
@@ -192,7 +197,6 @@ class AiAppointmentController(http.Controller):
             except Exception:
                 data = {}
 
-        # If JSON-RPC envelope: {"jsonrpc":"2.0","params":{...}}
         if isinstance(data, dict) and "params" in data and isinstance(data["params"], dict):
             data = data["params"]
 
@@ -213,8 +217,8 @@ class AiAppointmentController(http.Controller):
         Body example:
 
         {
-          "appointment_id": 11,
-          "appointment_title": "Dr Drizzle",
+          "appointment_type_id": 11,
+          "appointment_type_name": "Dr Drizzle",
           "date_preference": "2025-11-17",
           "time_window": "afternoon",
           "timezone": "America/New_York",
@@ -230,8 +234,8 @@ class AiAppointmentController(http.Controller):
                 "message": "date_preference is required (YYYY-MM-DD).",
             }
 
-        appointment_id = params.get("appointment_id")
-        appointment_title = params.get("appointment_title")
+        appointment_type_id = params.get("appointment_type_id") or params.get("appointment_id")
+        appointment_type_name = params.get("appointment_type_name") or params.get("appointment_title")
         time_window = params.get("time_window", "any")
         timezone_str = params.get("timezone", "UTC")
         duration = params.get("duration_minutes", 30)
@@ -256,11 +260,11 @@ class AiAppointmentController(http.Controller):
             if user:
                 user_ids = [user.id]
 
-        # 2) else derive from appointment.appointment
-        if not user_ids and (appointment_id or appointment_title):
+        # 2) else derive from appointment type
+        if not user_ids and (appointment_type_id or appointment_type_name):
             user = self._resolve_user_from_appointment(
-                appointment_id=appointment_id,
-                appointment_title=appointment_title,
+                appointment_type_id=appointment_type_id,
+                appointment_type_name=appointment_type_name,
             )
             if user:
                 user_ids = [user.id]
@@ -296,8 +300,8 @@ class AiAppointmentController(http.Controller):
         Body example:
 
         {
-          "appointment_id": 11,
-          "appointment_title": "Dr Drizzle",
+          "appointment_type_id": 11,
+          "appointment_type_name": "Dr Drizzle",
           "appointment_type": "Dr Drizzle - Online",
           "slot_start": "2025-11-17T13:00:00-05:00",
           "slot_end": "2025-11-17T14:00:00-05:00",
@@ -317,8 +321,8 @@ class AiAppointmentController(http.Controller):
         appointment_type = params.get("appointment_type", "Consultation")
         notes = params.get("notes", "")
 
-        appointment_id = params.get("appointment_id")
-        appointment_title = params.get("appointment_title")
+        appointment_type_id = params.get("appointment_type_id") or params.get("appointment_id")
+        appointment_type_name = params.get("appointment_type_name") or params.get("appointment_title")
         calendar_user_email = params.get("calendar_user_email")
 
         if not (start_iso and end_iso):
@@ -355,11 +359,11 @@ class AiAppointmentController(http.Controller):
             if user:
                 user_id = user.id
 
-        # 2) else derive from appointment.appointment
-        if not user_id and (appointment_id or appointment_title):
+        # 2) else derive from appointment type
+        if not user_id and (appointment_type_id or appointment_type_name):
             user = self._resolve_user_from_appointment(
-                appointment_id=appointment_id,
-                appointment_title=appointment_title,
+                appointment_type_id=appointment_type_id,
+                appointment_type_name=appointment_type_name,
             )
             if user:
                 user_id = user.id
