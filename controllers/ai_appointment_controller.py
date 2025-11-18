@@ -29,6 +29,9 @@ class AiAppointmentController(http.Controller):
       so it appears under that Appointment in the Odoo UI.
     """
 
+    # Static default assignee (Mark Khan) – res.users ID
+    STATIC_ASSIGNEE_USER_ID = 2
+
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
@@ -79,8 +82,13 @@ class AiAppointmentController(http.Controller):
         if not appt_type:
             return False
 
-        # In Odoo appointment, staff users are typically in field user_ids
-        users = getattr(appt_type, "user_ids", False)
+        # Odoo 18+ uses staff_user_ids, older versions used user_ids
+        users = False
+        if hasattr(appt_type, "staff_user_ids") and appt_type.staff_user_ids:
+            users = appt_type.staff_user_ids
+        elif hasattr(appt_type, "user_ids") and appt_type.user_ids:
+            users = appt_type.user_ids
+
         user = users[:1] if users else False
         return user
 
@@ -287,6 +295,10 @@ class AiAppointmentController(http.Controller):
             if user:
                 user_ids = [user.id]
 
+        # 3) final fallback – static default doctor (Mark Khan)
+        if not user_ids:
+            user_ids = [self.STATIC_ASSIGNEE_USER_ID]
+
         try:
             slots = self._compute_free_slots(
                 date_pref=date_pref,
@@ -392,6 +404,10 @@ class AiAppointmentController(http.Controller):
                 appointment_type_name=appointment_type_name,
             )
 
+        # 3) final fallback – static default doctor (Mark Khan)
+        if not user_id:
+            user_id = self.STATIC_ASSIGNEE_USER_ID
+
         # Convert ISO datetime strings to Odoo format (UTC)
         try:
             start_odoo_format = self._convert_iso_to_odoo_format(start_iso)
@@ -408,7 +424,6 @@ class AiAppointmentController(http.Controller):
         # Build attendees (partner_ids):
         #   - Caller / guest partner
         #   - Assigned user (doctor / staff) partner
-        # This ensures both appear in attendee list + emails.
         # ------------------------------------------------------------------
         partner_commands = []
 
@@ -421,11 +436,10 @@ class AiAppointmentController(http.Controller):
         if user_id:
             owner_user = env["res.users"].sudo().browse(user_id)
             owner_partner = owner_user.partner_id
-            if owner_partner and owner_partner.id != partner.id:
+            if owner_partner and (not partner or owner_partner.id != partner.id):
                 partner_commands.append((4, owner_partner.id))
 
-        # Fallback: if for some reason partner_commands is empty (shouldn't happen),
-        # at least add the caller partner.
+        # Fallback: ensure at least caller is present
         if not partner_commands and partner:
             partner_commands.append((4, partner.id))
 
