@@ -1,4 +1,3 @@
-# ai_appointment_webhook/controllers/ai_appointment_controller.py
 from odoo import http
 from odoo.http import request
 from datetime import datetime, time, timedelta
@@ -404,11 +403,21 @@ class AiAppointmentController(http.Controller):
 
         # Create calendar event
         Event = env["calendar.event"].sudo()
+
+        # Build partner list - include both customer AND staff user
+        partner_ids = [(4, partner.id)]  # Customer
+
+        # Add staff user as attendee if available
+        if user_id:
+            staff_user = env["res.users"].sudo().browse(user_id)
+            if staff_user and staff_user.partner_id:
+                partner_ids.append((4, staff_user.partner_id.id))  # Staff user's partner
+
         event_vals = {
             "name": f"{appointment_type_label} - {name}",
             "start": start_odoo_format,
             "stop": end_odoo_format,
-            "partner_ids": [(4, partner.id)],
+            "partner_ids": partner_ids,  # Both customer and staff
             "description": notes,
         }
 
