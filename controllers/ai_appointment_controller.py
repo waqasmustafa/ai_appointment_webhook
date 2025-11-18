@@ -1,4 +1,5 @@
-from odoo import http, fields
+# ai_appointment_webhook/controllers/ai_appointment_controller.py
+from odoo import http
 from odoo.http import request
 from datetime import datetime, time, timedelta
 import pytz
@@ -21,7 +22,11 @@ class AiAppointmentController(http.Controller):
          OR
       "appointment_type_name": "Dr Drizzle"
 
-    The controller will use that appointment type's staff members.
+    The controller will:
+    - find that appointment.type (Appointment Title)
+    - use its staff users for availability (their calendars)
+    - create a calendar.event with appointment_type_id set
+      so it appears under that Appointment in the Odoo UI.
     """
 
     # ---------------------------------------------------------------------
@@ -39,27 +44,11 @@ class AiAppointmentController(http.Controller):
             return time(9, 0), time(17, 0)
 
     def _get_appointment_type_obj(self, appointment_type_id=None, appointment_type_name=None):
-        """Get appointment type object for booking creation."""
+        """Resolve appointment.type (Appointment Title: Dr Drizzle)."""
         env = request.env
-
-        # Try different possible model names for Odoo 18
-        possible_models = [
-            "appointment.type",
-            "calendar.appointment.type",
-            "appointment.appointment.type",
-        ]
-
-        AppointmentType = None
-        for model_name in possible_models:
-            if model_name in env:
-                AppointmentType = env[model_name].sudo()
-                break
-
-        if not AppointmentType:
-            return False
+        AppointmentType = env["appointment.type"].sudo()
 
         appt_type = False
-
         if appointment_type_id:
             try:
                 appt_type = AppointmentType.browse(int(appointment_type_id))
@@ -72,23 +61,6 @@ class AiAppointmentController(http.Controller):
             appt_type = AppointmentType.search([("name", "=", appointment_type_name)], limit=1)
 
         return appt_type
-
-    def _get_staff_users_from_type(self, appt_type):
-        """Return ALL staff users linked to an appointment type."""
-        if not appt_type:
-            return request.env["res.users"].sudo().browse()
-
-        user_field_names = ["staff_user_ids", "user_ids", "resource_ids"]
-        users = request.env["res.users"].sudo().browse()
-
-        for field_name in user_field_names:
-            if field_name in appt_type._fields:
-                val = getattr(appt_type, field_name)
-                if val:
-                    users = val
-                    break
-
-        return users
 
     def _resolve_user_from_appointment(self, appointment_type_id=None, appointment_type_name=None):
         """
@@ -104,11 +76,11 @@ class AiAppointmentController(http.Controller):
             appointment_type_id=appointment_type_id,
             appointment_type_name=appointment_type_name,
         )
-
         if not appt_type:
             return False
 
-        users = self._get_staff_users_from_type(appt_type)
+        # In Odoo appointment, staff users are typically in field user_ids
+        users = getattr(appt_type, "user_ids", False)
         user = users[:1] if users else False
         return user
 
@@ -239,12 +211,7 @@ class AiAppointmentController(http.Controller):
     def _convert_iso_to_odoo_format(self, iso_datetime_str):
         """
         Convert ISO datetime string with timezone to Odoo's datetime format.
-
-        Args:
-            iso_datetime_str (str): ISO format like "2025-11-17T13:00:00-05:00"
-
-        Returns:
-            str: "YYYY-MM-DD HH:MM:SS" in UTC
+        e.g. "2025-11-17T13:00:00-05:00" -> "2025-11-17 18:00:00" (UTC)
         """
         try:
             dt_with_tz = datetime.fromisoformat(iso_datetime_str)
@@ -270,7 +237,7 @@ class AiAppointmentController(http.Controller):
         {
           "appointment_type_id": 11,
           "appointment_type_name": "Dr Drizzle",
-          "date_preference": "2025-11-18",
+          "date_preference": "2025-11-20",
           "time_window": "afternoon",
           "timezone": "America/New_York",
           "duration_minutes": 60
@@ -286,9 +253,7 @@ class AiAppointmentController(http.Controller):
             }
 
         appointment_type_id = params.get("appointment_type_id") or params.get("appointment_id")
-        appointment_type_name = params.get("appointment_type_name") or params.get(
-            "appointment_title"
-        )
+        appointment_type_name = params.get("appointment_type_name") or params.get("appointment_title")
         time_window = params.get("time_window", "any")
         timezone_str = params.get("timezone", "UTC")
         duration = params.get("duration_minutes", 30)
@@ -302,7 +267,7 @@ class AiAppointmentController(http.Controller):
                 "message": "duration_minutes must be an integer.",
             }
 
-        # Figure out which user calendar to use
+        # Which user calendar(s) to use
         user_ids = []
         env = request.env
 
@@ -313,7 +278,7 @@ class AiAppointmentController(http.Controller):
             if user:
                 user_ids = [user.id]
 
-        # 2) else derive from appointment type
+        # 2) else derive from appointment type (Dr Drizzle)
         if not user_ids and (appointment_type_id or appointment_type_name):
             user = self._resolve_user_from_appointment(
                 appointment_type_id=appointment_type_id,
@@ -356,8 +321,8 @@ class AiAppointmentController(http.Controller):
           "appointment_type_id": 11,
           "appointment_type_name": "Dr Drizzle",
           "appointment_type": "Dr Drizzle - Online",
-          "slot_start": "2025-11-18T13:00:00-05:00",
-          "slot_end": "2025-11-18T14:00:00-05:00",
+          "slot_start": "2025-11-20T13:00:00-05:00",
+          "slot_end":   "2025-11-20T14:00:00-05:00",
           "caller_name": "John Smith",
           "caller_phone": "+15551234567",
           "caller_email": "john@example.com",
@@ -375,9 +340,7 @@ class AiAppointmentController(http.Controller):
         notes = params.get("notes", "")
 
         appointment_type_id = params.get("appointment_type_id") or params.get("appointment_id")
-        appointment_type_name = params.get("appointment_type_name") or params.get(
-            "appointment_title"
-        )
+        appointment_type_name = params.get("appointment_type_name") or params.get("appointment_title")
         calendar_user_email = params.get("calendar_user_email")
 
         if not (start_iso and end_iso):
@@ -404,14 +367,6 @@ class AiAppointmentController(http.Controller):
                 vals["email"] = email
             partner = Partner.create(vals)
 
-        # Get appointment type & staff users
-        appointment_type_obj = self._get_appointment_type_obj(
-            appointment_type_id=appointment_type_id,
-            appointment_type_name=appointment_type_name,
-        )
-        staff_users = self._get_staff_users_from_type(appointment_type_obj)
-        staff_partner_ids = staff_users.mapped("partner_id").ids if staff_users else []
-
         # Determine owner user_id (calendar owner)
         user_id = False
 
@@ -422,11 +377,22 @@ class AiAppointmentController(http.Controller):
             if user:
                 user_id = user.id
 
-        # 2) else derive from appointment type
-        if not user_id and staff_users:
-            user_id = staff_users[:1].id
+        # 2) else derive from appointment.type (Dr Drizzle)
+        appointment_type_obj = None
+        if appointment_type_id or appointment_type_name:
+            user = self._resolve_user_from_appointment(
+                appointment_type_id=appointment_type_id,
+                appointment_type_name=appointment_type_name,
+            )
+            if user and not user_id:
+                user_id = user.id
 
-        # Convert ISO datetime strings to Odoo format
+            appointment_type_obj = self._get_appointment_type_obj(
+                appointment_type_id=appointment_type_id,
+                appointment_type_name=appointment_type_name,
+            )
+
+        # Convert ISO datetime strings to Odoo format (UTC)
         try:
             start_odoo_format = self._convert_iso_to_odoo_format(start_iso)
             end_odoo_format = self._convert_iso_to_odoo_format(end_iso)
@@ -436,25 +402,27 @@ class AiAppointmentController(http.Controller):
                 "message": str(e),
             }
 
-        # Build attendees list: caller + staff users' partners
-        attendee_partner_ids = [partner.id] + staff_partner_ids
-        # Deduplicate
-        attendee_partner_ids = list(set(attendee_partner_ids))
-
         # Create calendar event
         Event = env["calendar.event"].sudo()
         event_vals = {
             "name": f"{appointment_type_label} - {name}",
             "start": start_odoo_format,
             "stop": end_odoo_format,
-            # ALL attendees: caller + staff
-            "partner_ids": [(6, 0, attendee_partner_ids)],
+            "partner_ids": [(4, partner.id)],
             "description": notes,
         }
+
+        # Link to staff user (assignee)
         if user_id:
             event_vals["user_id"] = user_id
 
-        # Optional custom field
+        # *** KEY PART ***
+        # Link this event back to the Appointment Type (Dr Drizzle),
+        # so it appears in the Appointment module just like website bookings.
+        if appointment_type_obj and "appointment_type_id" in Event._fields:
+            event_vals["appointment_type_id"] = appointment_type_obj.id
+
+        # Optional custom field to mark AI source
         if "x_source" in Event._fields:
             event_vals["x_source"] = "ai_caller_agent"
 
@@ -466,47 +434,6 @@ class AiAppointmentController(http.Controller):
                 "message": f"Failed to create calendar event: {str(e)}",
             }
 
-        # Link to calendar.booking if that model exists
-        booking = None
-        if "calendar.booking" in env and appointment_type_obj:
-            Booking = env["calendar.booking"].sudo()
-
-            booking_vals = {
-                "name": event.name,
-                "calendar_event_id": event.id,
-                "start": event.start,
-                "stop": event.stop,
-            }
-
-            # Appointment type relation
-            if "appointment_type_id" in Booking._fields:
-                booking_vals["appointment_type_id"] = appointment_type_obj.id
-            elif "appointment_id" in Booking._fields:
-                booking_vals["appointment_id"] = appointment_type_obj.id
-
-            # Booked-by partner
-            if "partner_id" in Booking._fields:
-                booking_vals["partner_id"] = partner.id
-
-            # Appointment resources / staff (best-effort)
-            if staff_users:
-                # some DBs use appointment_resource_ids (to appointment.resource)
-                # others might use staff_user_ids or user_ids
-                if "appointment_resource_ids" in Booking._fields:
-                    # best-effort: if appointment_resource_ids is related to users,
-                    # you might need mapping; here we just skip to avoid crash
-                    pass
-                elif "staff_user_ids" in Booking._fields:
-                    booking_vals["staff_user_ids"] = [(6, 0, staff_users.ids)]
-                elif "user_ids" in Booking._fields:
-                    booking_vals["user_ids"] = [(6, 0, staff_users.ids)]
-
-            try:
-                booking = Booking.create(booking_vals)
-            except Exception:
-                # don't block API if booking creation fails
-                booking = None
-
         # Localize response to partner timezone for confirmation
         partner_tz = partner.tz or "UTC"
         try:
@@ -514,6 +441,7 @@ class AiAppointmentController(http.Controller):
         except Exception:
             local_tz = pytz.UTC
 
+        # Convert back to local time for response
         start_local = event.start.astimezone(local_tz)
         end_local = event.stop.astimezone(local_tz)
 
@@ -527,9 +455,10 @@ class AiAppointmentController(http.Controller):
             "message": "Calendar event created and linked to appointment type (if available)",
         }
 
-        if booking:
-            response["booking_id"] = booking.id
-
+        # We are NOT creating extra appointment.booking records here on purpose,
+        # to avoid KeyErrors on instances where that model doesn't exist.
+        # The Appointment module will still show this event under Dr Drizzle
+        # via appointment_type_id.
         return response
 
     # ---------------------------------------------------------------------
@@ -544,7 +473,7 @@ class AiAppointmentController(http.Controller):
     )
     def cancel_appointment(self, **params):
         """
-        Cancel an existing appointment.
+        Cancel an existing appointment (calendar.event).
 
         Body example:
         {
@@ -584,25 +513,33 @@ class AiAppointmentController(http.Controller):
         try:
             event_name = event.name
 
-            # Also try to cancel calendar.booking if exists
-            if "calendar.booking" in env:
-                Booking = env["calendar.booking"].sudo()
-                if "calendar_event_id" in Booking._fields:
-                    booking = Booking.search(
-                        [("calendar_event_id", "=", appointment_id)], limit=1
-                    )
-                    if booking:
-                        if "state" in booking._fields:
-                            booking.state = "cancelled"
-                        elif "status" in booking._fields:
-                            booking.status = "cancelled"
+            # If your DB has some booking models with a link to event,
+            # you can softly update them here without crashing if missing.
+            for model_name in [
+                "calendar.booking",
+                "appointment.booking",          # only if exists
+                "calendar.appointment.booking", # only if exists
+            ]:
+                if model_name in env:
+                    BookingModel = env[model_name].sudo()
+                    if "calendar_event_id" in BookingModel._fields:
+                        booking = BookingModel.search(
+                            [("calendar_event_id", "=", appointment_id)],
+                            limit=1,
+                        )
+                        if booking:
+                            # Try to mark as cancelled if a state-like field exists
+                            for field in ("state", "status", "booking_status"):
+                                if field in BookingModel._fields:
+                                    setattr(booking, field, "canceled")
+                                    break
 
-            event.message_post(body=f"Cancelled via AI caller: {reason}")
+            # Finally delete the calendar event
             event.unlink()
 
             return {
                 "status": "cancelled",
-                "message": f"Appointment '{event_name}' has been cancelled.",
+                "message": f"Appointment '{event_name}' has been cancelled. Reason: {reason}",
                 "appointment_id": appointment_id,
             }
         except Exception as e:
