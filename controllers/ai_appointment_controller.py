@@ -402,13 +402,39 @@ class AiAppointmentController(http.Controller):
                 "message": str(e),
             }
 
-        # Create calendar event
         Event = env["calendar.event"].sudo()
+
+        # ------------------------------------------------------------------
+        # Build attendees (partner_ids):
+        #   - Caller / guest partner
+        #   - Assigned user (doctor / staff) partner
+        # This ensures both appear in attendee list + emails.
+        # ------------------------------------------------------------------
+        partner_commands = []
+
+        # Guest / caller partner
+        if partner:
+            partner_commands.append((4, partner.id))
+
+        # Assigned user (doctor/staff) as attendee too
+        owner_partner = False
+        if user_id:
+            owner_user = env["res.users"].sudo().browse(user_id)
+            owner_partner = owner_user.partner_id
+            if owner_partner and owner_partner.id != partner.id:
+                partner_commands.append((4, owner_partner.id))
+
+        # Fallback: if for some reason partner_commands is empty (shouldn't happen),
+        # at least add the caller partner.
+        if not partner_commands and partner:
+            partner_commands.append((4, partner.id))
+
+        # Create calendar event
         event_vals = {
             "name": f"{appointment_type_label} - {name}",
             "start": start_odoo_format,
             "stop": end_odoo_format,
-            "partner_ids": [(4, partner.id)],
+            "partner_ids": partner_commands,
             "description": notes,
         }
 
@@ -416,7 +442,6 @@ class AiAppointmentController(http.Controller):
         if user_id:
             event_vals["user_id"] = user_id
 
-        # *** KEY PART ***
         # Link this event back to the Appointment Type (Dr Drizzle),
         # so it appears in the Appointment module just like website bookings.
         if appointment_type_obj and "appointment_type_id" in Event._fields:
