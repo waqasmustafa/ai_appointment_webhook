@@ -92,16 +92,87 @@ class AiAppointmentController(http.Controller):
         user = users[:1] if users else False
         return user
 
+    def _get_configured_slots_from_appointment(self, appointment_type_obj, date_pref, timezone_str):
+        """
+        Fetch configured time slots from appointment.type.slot for a specific date.
+        
+        Returns a list of slot intervals (start_datetime, end_datetime) in UTC,
+        based on the appointment type's Schedule configuration.
+        """
+        if not appointment_type_obj:
+            return []
+        
+        env = request.env
+        
+        # Check if appointment.type has slot_ids field
+        if not hasattr(appointment_type_obj, 'slot_ids'):
+            return []
+        
+        # Parse the requested date
+        try:
+            year, month, day = map(int, date_pref.split("-"))
+            requested_date = datetime(year, month, day)
+        except Exception:
+            return []
+        
+        # Get weekday (0=Monday, 6=Sunday in Python; Odoo uses 0=Monday too)
+        weekday = requested_date.weekday()
+        
+        # Resolve timezone
+        try:
+            tz = pytz.timezone(timezone_str or "UTC")
+        except Exception:
+            tz = pytz.UTC
+        
+        # Fetch configured slots for this weekday
+        configured_slots = []
+        for slot in appointment_type_obj.slot_ids:
+            # slot.weekday is typically stored as string: '0' for Monday, '1' for Tuesday, etc.
+            try:
+                slot_weekday = int(slot.weekday)
+            except (ValueError, AttributeError):
+                continue
+            
+            if slot_weekday != weekday:
+                continue
+            
+            # Convert float hours to datetime
+            # slot.start_hour and slot.end_hour are floats (e.g., 13.0 = 1:00 PM, 13.5 = 1:30 PM)
+            try:
+                start_hour = int(slot.start_hour)
+                start_minute = int((slot.start_hour - start_hour) * 60)
+                end_hour = int(slot.end_hour)
+                end_minute = int((slot.end_hour - end_hour) * 60)
+                
+                # Create datetime in local timezone
+                slot_start_local = tz.localize(
+                    datetime(year, month, day, start_hour, start_minute)
+                )
+                slot_end_local = tz.localize(
+                    datetime(year, month, day, end_hour, end_minute)
+                )
+                
+                # Convert to UTC for consistency
+                slot_start_utc = slot_start_local.astimezone(pytz.UTC)
+                slot_end_utc = slot_end_local.astimezone(pytz.UTC)
+                
+                configured_slots.append((slot_start_utc, slot_end_utc))
+            except (AttributeError, ValueError):
+                continue
+        
+        return configured_slots
+
     def _compute_free_slots(
-        self, date_pref, duration_minutes, time_window, timezone_str, user_ids=None
+        self, date_pref, duration_minutes, time_window, timezone_str, user_ids=None, appointment_type_obj=None
     ):
         """
-        - Build working window in caller's timezone.
+        - If appointment_type_obj is provided and has configured slots, use those.
+        - Otherwise, build working window in caller's timezone and generate slots.
         - Convert to UTC for DB queries.
         - Fetch overlapping events from calendar.event, optionally filtered by user_ids.
         - Merge busy intervals.
         - Compute free intervals.
-        - Split into fixed-size slots.
+        - Split into fixed-size slots (or use configured slots).
         - Return up to 10 slots (start/end in caller timezone).
         """
         env = request.env
@@ -119,20 +190,40 @@ class AiAppointmentController(http.Controller):
         except Exception:
             tz = pytz.UTC
 
-        # Working window in local time
-        start_hour, end_hour = self._get_window_hours(time_window)
-        day_start_local = tz.localize(
-            datetime(year, month, day, start_hour.hour, start_hour.minute)
-        )
-        day_end_local = tz.localize(
-            datetime(year, month, day, end_hour.hour, end_hour.minute)
-        )
+        # Try to get configured slots from appointment type
+        configured_slots = []
+        if appointment_type_obj:
+            configured_slots = self._get_configured_slots_from_appointment(
+                appointment_type_obj, date_pref, timezone_str
+            )
 
-        # Convert to UTC for DB search
-        day_start_utc = day_start_local.astimezone(pytz.UTC)
-        day_end_utc = day_end_local.astimezone(pytz.UTC)
+        # If we have configured slots, use them; otherwise fall back to auto-generation
+        if configured_slots:
+            # Use configured slots (already in UTC)
+            slot_intervals = configured_slots
+            
+            # Determine search window for busy events (min/max of all configured slots)
+            day_start_utc = min(s[0] for s in slot_intervals)
+            day_end_utc = max(s[1] for s in slot_intervals)
+        else:
+            # Fall back to auto-generation based on time window
+            # Working window in local time
+            start_hour, end_hour = self._get_window_hours(time_window)
+            day_start_local = tz.localize(
+                datetime(year, month, day, start_hour.hour, start_hour.minute)
+            )
+            day_end_local = tz.localize(
+                datetime(year, month, day, end_hour.hour, end_hour.minute)
+            )
 
-        # Build search domain
+            # Convert to UTC for DB search
+            day_start_utc = day_start_local.astimezone(pytz.UTC)
+            day_end_utc = day_end_local.astimezone(pytz.UTC)
+            
+            # We'll generate slots later
+            slot_intervals = None
+
+        # Build search domain for busy events
         domain = [
             ("start", "<", day_end_utc),
             ("stop", ">", day_start_utc),
@@ -158,32 +249,55 @@ class AiAppointmentController(http.Controller):
                 else:
                     merged.append([interval[0], interval[1]])
 
-        # Compute free intervals
-        free_intervals = []
-        current_start = day_start_utc
-        for b_start, b_end in merged:
-            if b_start > current_start:
-                free_intervals.append((current_start, b_start))
-            current_start = max(current_start, b_end)
-        if current_start < day_end_utc:
-            free_intervals.append((current_start, day_end_utc))
-
-        # Split free intervals into slots
-        delta = timedelta(minutes=duration_minutes)
+        # Check availability for configured slots OR generate free slots
         slots = []
-        for f_start, f_end in free_intervals:
-            slot_start = f_start
-            while slot_start + delta <= f_end:
-                slot_end = slot_start + delta
-                local_start = slot_start.astimezone(tz)
-                local_end = slot_end.astimezone(tz)
-                slots.append(
-                    {
+        
+        if slot_intervals:
+            # Check each configured slot for availability
+            for slot_start_utc, slot_end_utc in slot_intervals:
+                # Check if this slot overlaps with any busy interval
+                is_free = True
+                for b_start, b_end in merged:
+                    # Check for overlap
+                    if slot_start_utc < b_end and slot_end_utc > b_start:
+                        is_free = False
+                        break
+                
+                if is_free:
+                    # Convert to local timezone for response
+                    local_start = slot_start_utc.astimezone(tz)
+                    local_end = slot_end_utc.astimezone(tz)
+                    slots.append({
                         "start": local_start.isoformat(),
                         "end": local_end.isoformat(),
-                    }
-                )
-                slot_start += delta
+                    })
+        else:
+            # Auto-generate slots from free intervals
+            # Compute free intervals
+            free_intervals = []
+            current_start = day_start_utc
+            for b_start, b_end in merged:
+                if b_start > current_start:
+                    free_intervals.append((current_start, b_start))
+                current_start = max(current_start, b_end)
+            if current_start < day_end_utc:
+                free_intervals.append((current_start, day_end_utc))
+
+            # Split free intervals into slots
+            delta = timedelta(minutes=duration_minutes)
+            for f_start, f_end in free_intervals:
+                slot_start = f_start
+                while slot_start + delta <= f_end:
+                    slot_end = slot_start + delta
+                    local_start = slot_start.astimezone(tz)
+                    local_end = slot_end.astimezone(tz)
+                    slots.append(
+                        {
+                            "start": local_start.isoformat(),
+                            "end": local_end.isoformat(),
+                        }
+                    )
+                    slot_start += delta
 
         return slots[:10]
 
@@ -275,6 +389,14 @@ class AiAppointmentController(http.Controller):
                 "message": "duration_minutes must be an integer.",
             }
 
+        # Resolve appointment type object for configured slots
+        appointment_type_obj = None
+        if appointment_type_id or appointment_type_name:
+            appointment_type_obj = self._get_appointment_type_obj(
+                appointment_type_id=appointment_type_id,
+                appointment_type_name=appointment_type_name,
+            )
+
         # Which user calendar(s) to use
         user_ids = []
         env = request.env
@@ -287,7 +409,7 @@ class AiAppointmentController(http.Controller):
                 user_ids = [user.id]
 
         # 2) else derive from appointment type (Dr Drizzle)
-        if not user_ids and (appointment_type_id or appointment_type_name):
+        if not user_ids and appointment_type_obj:
             user = self._resolve_user_from_appointment(
                 appointment_type_id=appointment_type_id,
                 appointment_type_name=appointment_type_name,
@@ -306,6 +428,7 @@ class AiAppointmentController(http.Controller):
                 time_window=time_window,
                 timezone_str=timezone_str,
                 user_ids=user_ids or None,
+                appointment_type_obj=appointment_type_obj,
             )
         except Exception as e:
             return {"status": "error", "message": str(e)}
