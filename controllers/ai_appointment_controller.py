@@ -233,8 +233,15 @@ class AiAppointmentController(http.Controller):
 
         busy_events = CalendarEvent.search(domain)
 
-        # Collect busy intervals
-        busy_intervals = [(ev.start, ev.stop) for ev in busy_events]
+        # Collect busy intervals and convert to timezone-aware UTC
+        # Odoo stores datetimes as naive UTC, so we need to make them aware
+        busy_intervals = []
+        for ev in busy_events:
+            # Convert naive datetime to UTC-aware
+            start_aware = ev.start.replace(tzinfo=pytz.UTC) if ev.start.tzinfo is None else ev.start
+            stop_aware = ev.stop.replace(tzinfo=pytz.UTC) if ev.stop.tzinfo is None else ev.stop
+            busy_intervals.append((start_aware, stop_aware))
+        
         busy_intervals.sort(key=lambda x: x[0])
 
         # Merge overlapping intervals
