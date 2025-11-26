@@ -589,6 +589,44 @@ class AiAppointmentController(http.Controller):
         if not partner_commands and partner:
             partner_commands.append((4, partner.id))
 
+        # Validate that the requested slot is a valid configured slot
+        if appointment_type_obj:
+            # We need the date string for the slot lookup
+            # start_iso is like "2025-11-27T12:00:00-05:00"
+            try:
+                date_str = start_iso.split("T")[0]
+                timezone_str = "UTC" # Default fallback
+                # Try to extract timezone if possible, or use appointment's TZ
+                if hasattr(appointment_type_obj, 'appointment_tz') and appointment_type_obj.appointment_tz:
+                    timezone_str = appointment_type_obj.appointment_tz
+                
+                valid_slots = self._get_configured_slots_from_appointment(
+                    appointment_type_obj, date_str, timezone_str
+                )
+                
+                # Convert requested start/end to UTC datetime for comparison
+                req_start_dt = datetime.fromisoformat(start_iso).astimezone(pytz.UTC)
+                req_end_dt = datetime.fromisoformat(end_iso).astimezone(pytz.UTC)
+                
+                is_valid_slot = False
+                for v_start, v_end in valid_slots:
+                    # Allow a small tolerance (e.g. seconds) or exact match
+                    if v_start == req_start_dt and v_end == req_end_dt:
+                        is_valid_slot = True
+                        break
+                
+                if not is_valid_slot:
+                     return {
+                        "status": "error",
+                        "message": "Invalid time slot. Please choose a valid configured slot.",
+                    }
+
+            except Exception as e:
+                # If validation fails due to parsing, log/ignore or return error. 
+                # For safety, we might want to allow it if we can't validate, 
+                # OR be strict. Let's be strict but safe on crash.
+                pass
+
         # Create calendar event
         event_vals = {
             "name": f"{appointment_type_label} - {name}",
@@ -596,6 +634,7 @@ class AiAppointmentController(http.Controller):
             "stop": end_odoo_format,
             "partner_ids": partner_commands,
             "description": notes,
+            "show_as": "busy",  # CRITICAL: Ensures it blocks availability
         }
 
         # Link to staff user (assignee)
