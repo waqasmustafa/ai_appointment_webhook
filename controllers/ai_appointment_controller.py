@@ -44,7 +44,8 @@ class AiAppointmentController(http.Controller):
         elif time_window == "evening":
             return time(17, 0), time(20, 0)
         else:  # "any" or unknown
-            return time(9, 0), time(17, 0)
+            # Return full day to ensure we don't hide any potential slots
+            return time(0, 0), time(23, 59)
 
     def _get_appointment_type_obj(self, appointment_type_id=None, appointment_type_name=None):
         """Resolve appointment.type (Appointment Title: Dr Drizzle)."""
@@ -89,6 +90,10 @@ class AiAppointmentController(http.Controller):
         elif hasattr(appt_type, "user_ids") and appt_type.user_ids:
             users = appt_type.user_ids
 
+        # Sort users to ensure deterministic behavior (e.g. always pick the same one if multiple)
+        if users:
+            users = users.sorted('id')
+        
         user = users[:1] if users else False
         return user
 
@@ -115,25 +120,36 @@ class AiAppointmentController(http.Controller):
         except Exception:
             return []
         
-        # Get weekday (0=Monday, 6=Sunday in Python; Odoo uses 0=Monday too)
+        # Get weekday (0=Monday, 6=Sunday in Python)
         weekday = requested_date.weekday()
         
-        # Resolve timezone
+        # Resolve timezone: Use appointment type's timezone if available, else fallback to params or UTC
+        # This ensures slots are interpreted in the doctor's timezone, not the caller's.
+        appt_tz_name = False
+        if hasattr(appointment_type_obj, 'appointment_tz') and appointment_type_obj.appointment_tz:
+            appt_tz_name = appointment_type_obj.appointment_tz
+        
         try:
-            tz = pytz.timezone(timezone_str or "UTC")
+            # If appointment has a TZ, use it to interpret the slot hours
+            # Otherwise use the passed timezone (which might be wrong if caller is in different TZ)
+            tz_name = appt_tz_name or timezone_str or "UTC"
+            tz = pytz.timezone(tz_name)
         except Exception:
             tz = pytz.UTC
         
         # Fetch configured slots for this weekday
         configured_slots = []
         for slot in appointment_type_obj.slot_ids:
-            # slot.weekday is typically stored as string: '0' for Monday, '1' for Tuesday, etc.
+            # slot.weekday is typically stored as string: '1' for Monday ... '7' for Sunday in Odoo
             try:
-                slot_weekday = int(slot.weekday)
+                slot_weekday_int = int(slot.weekday)
             except (ValueError, AttributeError):
                 continue
             
-            if slot_weekday != weekday:
+            # Map Python 0-6 to Odoo 1-7
+            # Python: 0=Mon, 1=Tue, ... 6=Sun
+            # Odoo:   1=Mon, 2=Tue, ... 7=Sun
+            if slot_weekday_int != (weekday + 1):
                 continue
             
             # Convert float hours to datetime
@@ -144,7 +160,7 @@ class AiAppointmentController(http.Controller):
                 end_hour = int(slot.end_hour)
                 end_minute = int((slot.end_hour - end_hour) * 60)
                 
-                # Create datetime in local timezone
+                # Create datetime in the APPOINTMENT'S timezone
                 slot_start_local = tz.localize(
                     datetime(year, month, day, start_hour, start_minute)
                 )
@@ -306,7 +322,7 @@ class AiAppointmentController(http.Controller):
                     )
                     slot_start += delta
 
-        return slots[:10]
+        return slots
 
     def _get_payload(self, params):
         """
