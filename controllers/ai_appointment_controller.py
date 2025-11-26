@@ -671,6 +671,29 @@ class AiAppointmentController(http.Controller):
 
         try:
             event = Event.create(event_vals)
+            
+            # CRITICAL: Force the staff user's attendee status to 'accepted'
+            # Odoo sometimes leaves it as 'needsAction', which might not block website availability
+            if user_id:
+                Attendee = env["calendar.attendee"].sudo()
+                # Find the attendee record for this event and this partner
+                attendee = Attendee.search([
+                    ("event_id", "=", event.id),
+                    ("partner_id", "=", owner_partner.id if owner_partner else False)
+                ], limit=1)
+                
+                # If not found by partner, try searching by user's partner if we have it
+                if not attendee and user_id:
+                     staff_user = env["res.users"].sudo().browse(user_id)
+                     if staff_user.partner_id:
+                        attendee = Attendee.search([
+                            ("event_id", "=", event.id),
+                            ("partner_id", "=", staff_user.partner_id.id)
+                        ], limit=1)
+
+                if attendee:
+                    attendee.write({"state": "accepted"})
+
         except Exception as e:
             return {
                 "status": "error",
