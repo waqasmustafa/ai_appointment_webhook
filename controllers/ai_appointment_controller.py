@@ -611,6 +611,25 @@ class AiAppointmentController(http.Controller):
         if "x_source" in Event._fields:
             event_vals["x_source"] = "ai_caller_agent"
 
+        # Check for conflicts (double booking)
+        if user_id:
+            # Search for overlapping events for this user
+            # Overlap logic: (StartA < EndB) and (EndA > StartB)
+            domain = [
+                ("user_id", "=", user_id),
+                ("start", "<", end_odoo_format),
+                ("stop", ">", start_odoo_format),
+            ]
+            # Optional: Exclude cancelled events if your system keeps them
+            # domain.append(("active", "=", True)) 
+            
+            conflict_count = Event.search_count(domain)
+            if conflict_count > 0:
+                return {
+                    "status": "error",
+                    "message": "The requested time slot is already booked.",
+                }
+
         try:
             event = Event.create(event_vals)
         except Exception as e:
